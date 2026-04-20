@@ -1,0 +1,15 @@
+{
+  "name": "weekly-tournament-coordinator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GitHub Actions coordinator for the Weekly Tournament module.",
+  "scripts": {
+    "tick": "node tick.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
