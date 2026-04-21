@@ -15,7 +15,7 @@ const PHASE = Object.freeze({
 function epochUtc(config) {
   const dt = new Date(config.cycleEpochUtc);
   if (Number.isNaN(dt.getTime())) {
-    return new Date(Date.UTC(2026, 0, 5)); // 2026-01-05
+    return new Date(Date.UTC(2026, 0, 5));
   }
   return dt;
 }
