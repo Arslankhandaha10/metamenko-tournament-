@@ -58,11 +58,23 @@ async function main() {
       if (expected !== PHASE.Idle) await transitionTo(metaRef, meta, PHASE.Registration);
       break;
 
-    case PHASE.Registration:
-      if (expected === PHASE.SwissInProgress || expected === PHASE.Top8 || expected === PHASE.Complete) {
+    case PHASE.Registration: {
+      // Production path: time-based close — always honored regardless of mode.
+      const timeUp = expected === PHASE.SwissInProgress
+                  || expected === PHASE.Top8
+                  || expected === PHASE.Complete;
+      if (timeUp) {
         await closeRegistrationAndStart(cfg, root, cycleId, sessionPrefix, metaRef, meta);
+        break;
+      }
+
+      // Testing path: capacity-based early start (gated by useTestingHourMode so
+      // production cycles never get cut short just because the cap was hit early).
+      if (cfg.useTestingHourMode === true) {
+        await maybeEarlyStartFromCapacity(cfg, root, cycleId, sessionPrefix, metaRef, meta);
       }
       break;
+    }
 
     case PHASE.SwissInProgress:
       await advanceSwissIfReady(cfg, root, cycleId, sessionPrefix, metaRef, meta);
@@ -95,20 +107,94 @@ async function transitionTo(metaRef, meta, phase) {
   console.log(`[tick] meta.phase ${meta.phase} → ${phase}`);
 }
 
+/**
+ * Testing-only: if the participant cap is hit, stamp a grace timestamp and on
+ * a later tick (after `earlyStartDelaySeconds`) close registration early.
+ *
+ * Behavior:
+ *   - First tick after cap reached  → write meta.capReachedAtUtc, return.
+ *   - Subsequent ticks while waiting → log remaining time, return.
+ *   - Once grace elapses             → call closeRegistrationAndStart (same path
+ *                                      as the time-based trigger).
+ *   - Player un-registers in window  → clear meta.capReachedAtUtc so the timer
+ *                                      restarts the next time the cap is hit.
+ *
+ * Idempotent: safe across overlapping invocations because the stamp lives in
+ * Firestore, not in process memory.
+ */
+async function maybeEarlyStartFromCapacity(cfg, root, cycleId, sessionPrefix, metaRef, meta) {
+  const cap = Number(cfg.maxParticipants || 0);
+  if (cap <= 0) return;
+
+  const graceSec = Number(cfg.earlyStartDelaySeconds == null ? 60 : cfg.earlyStartDelaySeconds);
+  const all = await loadParticipants(root, cycleId);
+  const paid = all.filter(p => p.entryPaid === true).length;
+
+  if (paid >= cap) {
+    if (!meta.capReachedAtUtc) {
+      await metaRef.update({ capReachedAtUtc: new Date().toISOString() });
+      console.log(`[tick] (TEST) Cap reached ${paid}/${cap}. Auto-start in ${graceSec}s.`);
+      return;
+    }
+    const elapsedMs = Date.now() - new Date(meta.capReachedAtUtc).getTime();
+    if (elapsedMs >= graceSec * 1000) {
+      console.log('[tick] (TEST) Grace elapsed — starting tournament early.');
+      await closeRegistrationAndStart(cfg, root, cycleId, sessionPrefix, metaRef, meta);
+    } else {
+      const left = Math.ceil((graceSec * 1000 - elapsedMs) / 1000);
+      console.log(`[tick] (TEST) Cap held — auto-start in ${left}s.`);
+    }
+    return;
+  }
+
+  // Cap dropped below max (someone unregistered) — clear the stamp so the
+  // grace window restarts the next time the cap is reached.
+  if (meta.capReachedAtUtc) {
+    await metaRef.update({ capReachedAtUtc: null });
+    console.log(`[tick] (TEST) Cap dropped to ${paid}/${cap}. Grace stamp cleared.`);
+  }
+}
+
 async function closeRegistrationAndStart(cfg, root, cycleId, sessionPrefix, metaRef, meta) {
-  const participants = await loadParticipants(root, cycleId);
+  // Integrity gates:
+  //  1. Drop participants missing entryPaid=true (should be impossible with
+  //     Firestore rules in place, but defence in depth).
+  //  2. Trim to maxParticipants in case the client-side cap was bypassed. Keep
+  //     the earliest registrations deterministically.
+  const raw = await loadParticipants(root, cycleId);
+  let participants = raw.filter(p => p.entryPaid === true);
+  if (participants.length < raw.length) {
+    console.log(`[tick] Dropped ${raw.length - participants.length} non-paid participants.`);
+  }
+
+  const cap = Number(cfg.maxParticipants || 0);
+  if (cap > 0 && participants.length > cap) {
+    participants.sort((a, b) => String(a.registeredAtUtc || '').localeCompare(String(b.registeredAtUtc || '')));
+    participants = participants.slice(0, cap);
+    console.log(`[tick] Trimmed to maxParticipants=${cap}.`);
+  }
+
   if (participants.length < 2) {
-    console.log('[tick] Not enough participants — skipping to Complete.');
+    console.log('[tick] Not enough participants — skipping to Complete with no champion.');
     await metaRef.update({
       phase: PHASE.Complete,
       registrationClosedAtUtc: new Date().toISOString(),
       transitionedAtUtc: new Date().toISOString()
     });
+    // Write a minimal final_results doc so the UI doesn't hang forever waiting
+    // for one; champion fields stay empty which the client already handles.
+    await db().collection(`${root}/${cycleId}/final_results`).doc('info').set({
+      championUserId: '',
+      championUsername: '',
+      runnerUpUserId: '',
+      top8UserIds: [],
+      participantUserIds: participants.map(p => p.userId),
+      finalizedAtUtc: new Date().toISOString()
+    }, { merge: true });
     return;
   }
 
   if ((cfg.swissRounds || 0) > 0) {
-    // Start swiss round 0
     const pairs = nextSwissRound(participants);
     await writeRoundMatches(root, cycleId, 0, pairs, sessionPrefix, 'bo1');
     await metaRef.update({
@@ -118,7 +204,6 @@ async function closeRegistrationAndStart(cfg, root, cycleId, sessionPrefix, meta
     });
     console.log(`[tick] Swiss R0 paired: ${pairs.length} matches.`);
   } else {
-    // Skip swiss — go straight to single elim seeded by elo
     participants.sort((a, b) => (b.elo || 0) - (a.elo || 0));
     const seeds = participants.slice(0, cfg.topCutSize || participants.length).map(p => p.userId);
     const pairs = buildRoundZero(seeds);
@@ -136,7 +221,19 @@ async function advanceSwissIfReady(cfg, root, cycleId, sessionPrefix, metaRef, m
   const round = meta.currentRound || 0;
   const matches = await loadRoundMatches(root, cycleId, round);
   if (matches.length === 0) return;
-  const allDone = matches.every(m => m.status === 'completed' && m.winnerUserId);
+
+  // Sanity-check every reported winner: must be one of the match's two slots.
+  // If a cheater (or a bug) wrote a stranger's userId, flag the round as not
+  // done so we don't poison subsequent pairings.
+  const allDone = matches.every(m => {
+    if (m.status !== 'completed') return false;
+    if (!m.winnerUserId) return false;
+    if (m.winnerUserId !== m.slotAUserId && m.winnerUserId !== m.slotBUserId) {
+      console.warn(`[tick] Invalid winner on match ${m._id}: ${m.winnerUserId} not in slots.`);
+      return false;
+    }
+    return true;
+  });
   if (!allDone) return;
 
   // Update participant stats
@@ -192,14 +289,34 @@ async function startTopCut(cfg, root, cycleId, sessionPrefix, metaRef, meta) {
 async function advanceEliminationIfReady(cfg, root, cycleId, sessionPrefix, metaRef, meta) {
   const round = meta.currentRound || 100;
   const matches = await loadRoundMatches(root, cycleId, round);
-  if (matches.length === 0) return;
-  const allDone = matches.every(m => m.status === 'completed' && m.winnerUserId);
+
+  // Safeguard: if the current elimination round has zero matches, the bracket
+  // was somehow paired into an empty set (degenerate seed count, bad earlier
+  // state, etc.). Pick the highest-seeded participant as the champion and
+  // finalize so the cycle does not hang forever.
+  if (matches.length === 0) {
+    const all = await loadParticipants(root, cycleId);
+    all.sort((a, b) => (b.swissPoints || 0) - (a.swissPoints || 0) || (b.elo || 0) - (a.elo || 0));
+    const fallback = all[0] && all[0].userId ? all[0].userId : '';
+    console.log(`[tick] Empty elim round ${round} — finalizing with fallback champion=${fallback}`);
+    await finalize(cfg, root, cycleId, metaRef, fallback);
+    return;
+  }
+
+  const allDone = matches.every(m => {
+    if (m.status !== 'completed') return false;
+    if (!m.winnerUserId) return false;
+    // Bye has empty slotB; winnerUserId must still equal slotAUserId in that case.
+    if (m.slotBUserId) {
+      return m.winnerUserId === m.slotAUserId || m.winnerUserId === m.slotBUserId;
+    }
+    return m.winnerUserId === m.slotAUserId;
+  });
   if (!allDone) return;
 
   const winners = matches.map(m => m.winnerUserId).filter(Boolean);
   if (winners.length <= 1) {
-    // Champion decided
-    await finalize(cfg, root, cycleId, metaRef, winners[0]);
+    await finalize(cfg, root, cycleId, metaRef, winners[0] || '');
     return;
   }
 

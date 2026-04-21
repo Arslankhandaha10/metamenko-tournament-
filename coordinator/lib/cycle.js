@@ -21,6 +21,11 @@ function epochUtc(config) {
 }
 
 function cycleDurationMs(config) {
+  // Testing mode: HOURS instead of DAYS so a full tournament fits in <1h.
+  // Mirrors WtConfig.CycleDuration in C#. KEEP IN SYNC.
+  if (config && config.useTestingHourMode === true) {
+    return Math.max(1, Number(config.cycleDurationHours || 1)) * 60 * 60 * 1000;
+  }
   return Math.max(1, Number(config.cycleDurationDays || 7)) * 24 * 60 * 60 * 1000;
 }
 
