@@ -76,8 +76,25 @@ async function main() {
       break;
     }
 
-    case PHASE.SwissInProgress:
+    case PHASE.SwissInProgress: {
+      // advanceSwissIfReady flips meta.phase → SwissComplete once every current
+      // swiss round has a valid winnerUserId. We MUST re-read meta after that
+      // call because the in-memory `meta` object is stale. Only then decide
+      // whether to enter Top Cut — otherwise we could stomp an in-progress
+      // swiss round with a premature top-cut bracket based on zero-point seeds.
       await advanceSwissIfReady(cfg, root, cycleId, sessionPrefix, metaRef, meta);
+      const refreshed = (await metaRef.get()).data() || meta;
+      const swissDone = refreshed.phase === PHASE.SwissComplete;
+      const timeReachedCut = expected === PHASE.Top8 || expected === PHASE.Complete;
+      if (swissDone && timeReachedCut) {
+        await startTopCut(cfg, root, cycleId, sessionPrefix, metaRef, refreshed);
+      }
+      break;
+    }
+
+    case PHASE.SwissComplete:
+      // Swiss done but top cut not yet started (e.g. coordinator crashed between
+      // states). Enter Top Cut as soon as the time window says so.
       if (expected === PHASE.Top8 || expected === PHASE.Complete) {
         await startTopCut(cfg, root, cycleId, sessionPrefix, metaRef, meta);
       }
@@ -287,7 +304,12 @@ async function startTopCut(cfg, root, cycleId, sessionPrefix, metaRef, meta) {
 }
 
 async function advanceEliminationIfReady(cfg, root, cycleId, sessionPrefix, metaRef, meta) {
-  const round = meta.currentRound || 100;
+  // IMPORTANT: `0` is a valid currentRound (happens when swissRounds=0 and the
+  // initial top-cut bracket is written at round 0 by closeRegistrationAndStart).
+  // Do NOT use `|| 100` here — JS treats 0 as falsy and we'd skip to a bogus
+  // round 100 which has no matches, causing premature finalize with the wrong
+  // champion.
+  const round = (typeof meta.currentRound === 'number') ? meta.currentRound : 100;
   const matches = await loadRoundMatches(root, cycleId, round);
 
   // Safeguard: if the current elimination round has zero matches, the bracket
