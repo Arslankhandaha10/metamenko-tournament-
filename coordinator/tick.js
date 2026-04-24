@@ -2,23 +2,38 @@
  * Coordinator entry point. Runs once per scheduled invocation.
  * Idempotent: safe to invoke many times within the same window.
  *
- * Workflow per tick:
+ * Legacy workflow (multiRoomEnabled=false):
  *   1. Read tournament_config/active.
  *   2. Compute current cycleId + expected phase.
- *   3. Read meta/info for current cycle.
- *   4. If meta missing → openRegistration().
- *   5. Compare meta.phase → expectedPhase, advance if behind:
- *        Registration → SwissInProgress / Top8: closeRegistrationAndPair()
- *        SwissInProgress: advanceRoundIfReady()
- *        Top8 / Finals: progress single-elim
- *        Complete: finalize()
+ *   3. Process that single cycle with processCycle().
+ *
+ * Multi-room workflow (multiRoomEnabled=true):
+ *   1. Read tournament_config/active.
+ *   2. Compute cycleBase = "{type}_C{NNNN}-{yyyy-MM-dd}".
+ *   3. Load tournament_registry/{cycleBase}. If absent -> nobody registered yet -> exit.
+ *   4. For each room in registry.rooms, compose cycleId = cycleBase + "_" + roomId
+ *      and call processCycle() independently so each league advances in parallel.
+ *   5. On finalize, mark registry.rooms[i].completed so future ticks skip it.
+ *
+ * processCycle() is the SAME per-cycle logic from the legacy flow — it just
+ * receives a fully composed cycleId plus the meta-enrichment fields for
+ * multi-room (cycleBase, roomId, eloBandKey). Single-room callers pass
+ * cycleBase == cycleId and roomId == "" which leaves the meta fields empty.
  */
 const { db } = require('./lib/firebase');
-const { PHASE, currentCycleId, expectedPhase, currentCycleStart } = require('./lib/cycle');
+const {
+  PHASE,
+  currentCycleId,
+  currentCycleBase,
+  composeCycleId,
+  expectedPhase,
+  currentCycleStart
+} = require('./lib/cycle');
 const { nextSwissRound } = require('./lib/swiss');
 const { buildRoundZero, nextRoundFromWinners } = require('./lib/elimination');
+const { loadRegistry, markRoomCompleted } = require('./lib/registry');
 
-const CONFIG_PATH = 'tournament_config/active';
+const CONFIG_PATH = process.env.WT_CONFIG_PATH || 'tournament_config/active';
 
 async function main() {
   const cfg = await loadConfig();
@@ -27,17 +42,81 @@ async function main() {
   const root = cfg.rootCollection || 'tournament_cycles';
   const sessionPrefix = cfg.sessionNamePrefix || 'WT';
   const now = new Date();
+
+  if (cfg.multiRoomEnabled === true) {
+    await tickMultiRoom(cfg, root, sessionPrefix, now);
+  } else {
+    await tickSingleRoom(cfg, root, sessionPrefix, now);
+  }
+}
+
+async function tickSingleRoom(cfg, root, sessionPrefix, now) {
   const cycleId = currentCycleId(cfg, now);
   const expected = expectedPhase(cfg, now);
+  console.log(`[tick][single] cycleId=${cycleId} expected=${expected}`);
+  await processCycle(cfg, root, sessionPrefix, now, {
+    cycleId,
+    cycleBase: cycleId,
+    roomId: '',
+    eloBandKey: ''
+  });
+}
 
-  console.log(`[tick] cycleId=${cycleId} expected=${expected}`);
+async function tickMultiRoom(cfg, root, sessionPrefix, now) {
+  const cycleBase = currentCycleBase(cfg, now);
+  const expected = expectedPhase(cfg, now);
+  console.log(`[tick][multi] cycleBase=${cycleBase} expected=${expected}`);
+
+  const registry = await loadRegistry(cfg, cycleBase);
+  if (!registry || !Array.isArray(registry.rooms) || registry.rooms.length === 0) {
+    console.log('[tick][multi] No rooms yet — nothing to tick.');
+    return;
+  }
+
+  for (const room of registry.rooms) {
+    if (!room || !room.roomId) continue;
+    if (room.completed === true) {
+      console.log(`[tick][multi] Skip completed room ${room.roomId}`);
+      continue;
+    }
+    const cycleId = composeCycleId(cycleBase, room.roomId);
+    console.log(`[tick][multi] → room ${room.roomId} (${cycleId}) band=${room.eloBandKey || 'All'}`);
+    try {
+      const finalized = await processCycle(cfg, root, sessionPrefix, now, {
+        cycleId,
+        cycleBase,
+        roomId: room.roomId,
+        eloBandKey: room.eloBandKey || ''
+      });
+      if (finalized) {
+        await markRoomCompleted(cfg, cycleBase, room.roomId);
+        console.log(`[tick][multi] Marked ${room.roomId} completed in registry.`);
+      }
+    } catch (e) {
+      // Keep iterating other rooms even if one fails so a single bad room
+      // does not block the entire cycle.
+      console.error(`[tick][multi] Room ${room.roomId} failed:`, e);
+    }
+  }
+}
+
+/**
+ * Process a single per-room cycle. Returns true when the cycle was finalized
+ * (so the caller may mark it completed in the registry), false otherwise.
+ *
+ * `ctx` carries the shared identifying fields written into meta the first time
+ * we initialize this room: cycleBase, roomId, eloBandKey.
+ */
+async function processCycle(cfg, root, sessionPrefix, now, ctx) {
+  const cycleId = ctx.cycleId;
+  const expected = expectedPhase(cfg, now);
 
   const cycleRef = db().collection(root).doc(cycleId);
   const metaRef = cycleRef.collection('meta').doc('info');
   let meta = (await metaRef.get()).data();
 
   if (!meta) {
-    // First time we see this cycle — initialize meta in Idle/Registration based on time.
+    // First time — stamp meta with all multi-room identifying fields.
     meta = {
       cycleId,
       phase: expected === PHASE.Idle ? PHASE.Idle : PHASE.Registration,
@@ -46,42 +125,37 @@ async function main() {
       cycleDurationDays: cfg.cycleDurationDays,
       openedAtUtc: now.toISOString(),
       registrationClosedAtUtc: '',
-      refundIssued: false
+      refundIssued: false,
+      tournamentType: cfg.tournamentType || 'weekly',
+      cycleBase: ctx.cycleBase || cycleId,
+      roomId: ctx.roomId || '',
+      eloBandKey: ctx.eloBandKey || ''
     };
     await metaRef.set(meta);
     console.log(`[tick] Initialized meta for ${cycleId} → ${meta.phase}`);
-    return;
+    return false;
   }
 
   switch (meta.phase) {
     case PHASE.Idle:
       if (expected !== PHASE.Idle) await transitionTo(metaRef, meta, PHASE.Registration);
-      break;
+      return false;
 
     case PHASE.Registration: {
-      // Production path: time-based close — always honored regardless of mode.
       const timeUp = expected === PHASE.SwissInProgress
                   || expected === PHASE.Top8
                   || expected === PHASE.Complete;
       if (timeUp) {
         await closeRegistrationAndStart(cfg, root, cycleId, sessionPrefix, metaRef, meta);
-        break;
+        return false;
       }
-
-      // Testing path: capacity-based early start (gated by useTestingHourMode so
-      // production cycles never get cut short just because the cap was hit early).
       if (cfg.useTestingHourMode === true) {
         await maybeEarlyStartFromCapacity(cfg, root, cycleId, sessionPrefix, metaRef, meta);
       }
-      break;
+      return false;
     }
 
     case PHASE.SwissInProgress: {
-      // advanceSwissIfReady flips meta.phase → SwissComplete once every current
-      // swiss round has a valid winnerUserId. We MUST re-read meta after that
-      // call because the in-memory `meta` object is stale. Only then decide
-      // whether to enter Top Cut — otherwise we could stomp an in-progress
-      // swiss round with a premature top-cut bracket based on zero-point seeds.
       await advanceSwissIfReady(cfg, root, cycleId, sessionPrefix, metaRef, meta);
       const refreshed = (await metaRef.get()).data() || meta;
       const swissDone = refreshed.phase === PHASE.SwissComplete;
@@ -89,26 +163,25 @@ async function main() {
       if (swissDone && timeReachedCut) {
         await startTopCut(cfg, root, cycleId, sessionPrefix, metaRef, refreshed);
       }
-      break;
+      return false;
     }
 
     case PHASE.SwissComplete:
-      // Swiss done but top cut not yet started (e.g. coordinator crashed between
-      // states). Enter Top Cut as soon as the time window says so.
       if (expected === PHASE.Top8 || expected === PHASE.Complete) {
         await startTopCut(cfg, root, cycleId, sessionPrefix, metaRef, meta);
       }
-      break;
+      return false;
 
     case PHASE.Top8:
-    case PHASE.Finals:
-      await advanceEliminationIfReady(cfg, root, cycleId, sessionPrefix, metaRef, meta);
-      break;
+    case PHASE.Finals: {
+      const completed = await advanceEliminationIfReady(cfg, root, cycleId, sessionPrefix, metaRef, meta);
+      return completed === true;
+    }
 
     case PHASE.Complete:
-      // nothing to do
-      break;
+      return true;
   }
+  return false;
 }
 
 async function loadConfig() {
@@ -128,16 +201,7 @@ async function transitionTo(metaRef, meta, phase) {
  * Testing-only: if the participant cap is hit, stamp a grace timestamp and on
  * a later tick (after `earlyStartDelaySeconds`) close registration early.
  *
- * Behavior:
- *   - First tick after cap reached  → write meta.capReachedAtUtc, return.
- *   - Subsequent ticks while waiting → log remaining time, return.
- *   - Once grace elapses             → call closeRegistrationAndStart (same path
- *                                      as the time-based trigger).
- *   - Player un-registers in window  → clear meta.capReachedAtUtc so the timer
- *                                      restarts the next time the cap is hit.
- *
- * Idempotent: safe across overlapping invocations because the stamp lives in
- * Firestore, not in process memory.
+ * Same semantics as before — see commit history for full behavior docs.
  */
 async function maybeEarlyStartFromCapacity(cfg, root, cycleId, sessionPrefix, metaRef, meta) {
   const cap = Number(cfg.maxParticipants || 0);
@@ -164,8 +228,6 @@ async function maybeEarlyStartFromCapacity(cfg, root, cycleId, sessionPrefix, me
     return;
   }
 
-  // Cap dropped below max (someone unregistered) — clear the stamp so the
-  // grace window restarts the next time the cap is reached.
   if (meta.capReachedAtUtc) {
     await metaRef.update({ capReachedAtUtc: null });
     console.log(`[tick] (TEST) Cap dropped to ${paid}/${cap}. Grace stamp cleared.`);
@@ -173,11 +235,6 @@ async function maybeEarlyStartFromCapacity(cfg, root, cycleId, sessionPrefix, me
 }
 
 async function closeRegistrationAndStart(cfg, root, cycleId, sessionPrefix, metaRef, meta) {
-  // Integrity gates:
-  //  1. Drop participants missing entryPaid=true (should be impossible with
-  //     Firestore rules in place, but defence in depth).
-  //  2. Trim to maxParticipants in case the client-side cap was bypassed. Keep
-  //     the earliest registrations deterministically.
   const raw = await loadParticipants(root, cycleId);
   let participants = raw.filter(p => p.entryPaid === true);
   if (participants.length < raw.length) {
@@ -198,8 +255,6 @@ async function closeRegistrationAndStart(cfg, root, cycleId, sessionPrefix, meta
       registrationClosedAtUtc: new Date().toISOString(),
       transitionedAtUtc: new Date().toISOString()
     });
-    // Write a minimal final_results doc so the UI doesn't hang forever waiting
-    // for one; champion fields stay empty which the client already handles.
     await db().collection(`${root}/${cycleId}/final_results`).doc('info').set({
       championUserId: '',
       championUsername: '',
@@ -239,9 +294,6 @@ async function advanceSwissIfReady(cfg, root, cycleId, sessionPrefix, metaRef, m
   const matches = await loadRoundMatches(root, cycleId, round);
   if (matches.length === 0) return;
 
-  // Sanity-check every reported winner: must be one of the match's two slots.
-  // If a cheater (or a bug) wrote a stranger's userId, flag the round as not
-  // done so we don't poison subsequent pairings.
   const allDone = matches.every(m => {
     if (m.status !== 'completed') return false;
     if (!m.winnerUserId) return false;
@@ -253,7 +305,6 @@ async function advanceSwissIfReady(cfg, root, cycleId, sessionPrefix, metaRef, m
   });
   if (!allDone) return;
 
-  // Update participant stats
   const participants = await loadParticipants(root, cycleId);
   const map = new Map(participants.map(p => [p.userId, p]));
   for (const m of matches) {
@@ -276,7 +327,6 @@ async function advanceSwissIfReady(cfg, root, cycleId, sessionPrefix, metaRef, m
     db().collection(`${root}/${cycleId}/participants`).doc(p.userId).set(p, { merge: true })
   ));
 
-  // Next swiss round?
   if (round + 1 < (cfg.swissRounds || 0)) {
     const pairs = nextSwissRound(participants);
     await writeRoundMatches(root, cycleId, round + 1, pairs, sessionPrefix, 'bo1');
@@ -297,49 +347,38 @@ async function startTopCut(cfg, root, cycleId, sessionPrefix, metaRef, meta) {
   });
   const seeds = participants.slice(0, cfg.topCutSize || participants.length).map(p => p.userId);
   const pairs = buildRoundZero(seeds);
-  // Top-cut rounds are written under a fresh round index range (0, 1, 2 ...) — they live in the same active_matches collection but with id prefix TC.
   await writeRoundMatches(root, cycleId, 100, pairs, sessionPrefix, 'bo1');
   await metaRef.update({ phase: PHASE.Top8, currentRound: 100 });
   console.log(`[tick] Top cut R100 paired with ${pairs.length} matches.`);
 }
 
 async function advanceEliminationIfReady(cfg, root, cycleId, sessionPrefix, metaRef, meta) {
-  // IMPORTANT: `0` is a valid currentRound (happens when swissRounds=0 and the
-  // initial top-cut bracket is written at round 0 by closeRegistrationAndStart).
-  // Do NOT use `|| 100` here — JS treats 0 as falsy and we'd skip to a bogus
-  // round 100 which has no matches, causing premature finalize with the wrong
-  // champion.
   const round = (typeof meta.currentRound === 'number') ? meta.currentRound : 100;
   const matches = await loadRoundMatches(root, cycleId, round);
 
-  // Safeguard: if the current elimination round has zero matches, the bracket
-  // was somehow paired into an empty set (degenerate seed count, bad earlier
-  // state, etc.). Pick the highest-seeded participant as the champion and
-  // finalize so the cycle does not hang forever.
   if (matches.length === 0) {
     const all = await loadParticipants(root, cycleId);
     all.sort((a, b) => (b.swissPoints || 0) - (a.swissPoints || 0) || (b.elo || 0) - (a.elo || 0));
     const fallback = all[0] && all[0].userId ? all[0].userId : '';
     console.log(`[tick] Empty elim round ${round} — finalizing with fallback champion=${fallback}`);
     await finalize(cfg, root, cycleId, metaRef, fallback);
-    return;
+    return true;
   }
 
   const allDone = matches.every(m => {
     if (m.status !== 'completed') return false;
     if (!m.winnerUserId) return false;
-    // Bye has empty slotB; winnerUserId must still equal slotAUserId in that case.
     if (m.slotBUserId) {
       return m.winnerUserId === m.slotAUserId || m.winnerUserId === m.slotBUserId;
     }
     return m.winnerUserId === m.slotAUserId;
   });
-  if (!allDone) return;
+  if (!allDone) return false;
 
   const winners = matches.map(m => m.winnerUserId).filter(Boolean);
   if (winners.length <= 1) {
     await finalize(cfg, root, cycleId, metaRef, winners[0] || '');
-    return;
+    return true;
   }
 
   const finalsThisRound = winners.length === 2;
@@ -351,16 +390,13 @@ async function advanceEliminationIfReady(cfg, root, cycleId, sessionPrefix, meta
     currentRound: round + 1
   });
   console.log(`[tick] Elim R${round + 1} paired: ${pairs.length}.`);
+  return false;
 }
 
 async function finalize(cfg, root, cycleId, metaRef, championUserId) {
   const participants = await loadParticipants(root, cycleId);
   const champion = participants.find(p => p.userId === championUserId);
 
-  // Runner-up: loser of the FINAL match (the real Bo1/Bo3 final), which is the
-  // completed contested match with the highest roundIndex. We deliberately skip:
-  //   - matches with no slotB (bye advancement, has no real loser)
-  //   - matches whose loser equals the champion (shouldn't happen, defensive)
   const allMatches = await loadAllMatches(root, cycleId);
   const contestedDesc = allMatches
     .filter(m => m.status === 'completed' && m.slotAUserId && m.slotBUserId && m.winnerUserId)
@@ -371,17 +407,51 @@ async function finalize(cfg, root, cycleId, metaRef, championUserId) {
     const loser = m.winnerUserId === m.slotAUserId ? m.slotBUserId : m.slotAUserId;
     if (loser && loser !== championUserId) { runnerUpId = loser; break; }
   }
-
-  // Final safety net: if every final-round match was a bye, fall back to the
-  // highest-seeded non-champion in the elimination bracket.
   if (!runnerUpId) {
     const bracketMatches = allMatches.filter(m => m.slotAUserId && m.slotAUserId !== championUserId);
     if (bracketMatches.length > 0) runnerUpId = bracketMatches[0].slotAUserId;
   }
 
-  // Top 8 = top by swiss points after sort
-  const sorted = participants.slice().sort((a, b) => (b.swissPoints || 0) - (a.swissPoints || 0));
-  const top8 = sorted.slice(0, Math.min(8, sorted.length)).map(p => p.userId);
+  // Top 8 = the eight players who progressed FURTHEST through the bracket.
+  // Ranking precedence:
+  //   1) higher max round-index reached
+  //   2) ...with a win in that round (winners outrank losers of the same round)
+  //   3) ...higher swissPoints (only meaningful if swiss rounds were played)
+  //   4) ...higher ELO as a final tie-breaker
+  // The previous implementation sorted purely on swissPoints which is ZERO
+  // for everyone in pure single-elimination mode, so the Top-8 reward bucket
+  // ended up containing an arbitrary 8 participants (sorted by userId by
+  // Firestore) instead of the true quarter-finalists.
+  const reachStats = new Map();
+  for (const p of participants) {
+    reachStats.set(p.userId, { reached: -1, wonReached: false });
+  }
+  for (const m of allMatches) {
+    if (!m || typeof m.roundIndex !== 'number') continue;
+    if (m.status !== 'completed') continue;
+    const round = m.roundIndex;
+    const slots = [m.slotAUserId, m.slotBUserId].filter(Boolean);
+    for (const uid of slots) {
+      const s = reachStats.get(uid);
+      if (!s) continue;
+      if (round > s.reached) {
+        s.reached = round;
+        s.wonReached = (uid === m.winnerUserId);
+      } else if (round === s.reached && uid === m.winnerUserId) {
+        s.wonReached = true;
+      }
+    }
+  }
+  const ranked = participants.slice().sort((a, b) => {
+    const sa = reachStats.get(a.userId) || { reached: -1, wonReached: false };
+    const sb = reachStats.get(b.userId) || { reached: -1, wonReached: false };
+    if (sb.reached !== sa.reached) return sb.reached - sa.reached;
+    if (sb.wonReached !== sa.wonReached) return sb.wonReached ? 1 : -1;
+    const sp = (b.swissPoints || 0) - (a.swissPoints || 0);
+    if (sp !== 0) return sp;
+    return (b.elo || 0) - (a.elo || 0);
+  });
+  const top8 = ranked.slice(0, Math.min(8, ranked.length)).map(p => p.userId);
 
   const finalDoc = {
     championUserId,
@@ -393,7 +463,7 @@ async function finalize(cfg, root, cycleId, metaRef, championUserId) {
   };
   await db().collection(`${root}/${cycleId}/final_results`).doc('info').set(finalDoc);
   await metaRef.update({ phase: PHASE.Complete });
-  console.log(`[tick] Finalized. Champion=${championUserId}`);
+  console.log(`[tick] Finalized ${cycleId}. Champion=${championUserId} top8=${top8.join(',')}`);
 }
 
 async function loadParticipants(root, cycleId) {
@@ -414,13 +484,18 @@ async function loadAllMatches(root, cycleId) {
 
 async function writeRoundMatches(root, cycleId, roundIndex, pairs, sessionPrefix, format) {
   const batch = db().batch();
-  const cycleShort = cycleId.slice(0, 8);
+  // Fusion session names must be globally unique across concurrently-running
+  // rooms. The old `cycleId.slice(0, 8)` collapsed every multi-room cycle to
+  // "weekly_C", so R001's Round 100 match 0 and R002's Round 100 match 0 would
+  // share a session — dropping players from different leagues into the same
+  // Fusion room. Use a compact short-hash of the full cycleId instead.
+  const cycleToken = shortCycleToken(cycleId);
   for (let i = 0; i < pairs.length; i++) {
     const p = pairs[i];
     const docId = `R${roundIndex}_M${i}`;
     const sessionName = p.slotBUserId
-      ? `${sessionPrefix}_${cycleShort}_R${roundIndex}_M${i}`
-      : ''; // bye — no session needed
+      ? `${sessionPrefix}_${cycleToken}_R${roundIndex}_M${i}`
+      : '';
     const ref = db().collection(`${root}/${cycleId}/active_matches`).doc(docId);
     batch.set(ref, {
       cycleId,
@@ -438,6 +513,25 @@ async function writeRoundMatches(root, cycleId, roundIndex, pairs, sessionPrefix
     });
   }
   await batch.commit();
+}
+
+/**
+ * Deterministic 8-char base36 token derived from the full cycleId. Guarantees
+ * distinct rooms of the same cycle get distinct Fusion session names while
+ * keeping the human-readable name short. Not cryptographic — a weak hash is
+ * fine here because the coordinator is the sole writer.
+ */
+function shortCycleToken(cycleId) {
+  if (!cycleId) return 'cyc00000';
+  let h1 = 0x12345678;
+  let h2 = 0x87654321;
+  for (let i = 0; i < cycleId.length; i++) {
+    const c = cycleId.charCodeAt(i);
+    h1 = ((h1 ^ c) * 16777619) >>> 0;
+    h2 = ((h2 + c * 1099511) ^ (h1 >>> 3)) >>> 0;
+  }
+  const raw = (h1.toString(36) + h2.toString(36)).replace(/[^a-z0-9]/gi, '');
+  return (raw + '00000000').slice(0, 8);
 }
 
 main()
