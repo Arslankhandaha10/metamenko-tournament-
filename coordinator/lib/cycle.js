@@ -15,7 +15,7 @@ const PHASE = Object.freeze({
 function epochUtc(config) {
   const dt = new Date(config.cycleEpochUtc);
   if (Number.isNaN(dt.getTime())) {
-    return new Date(Date.UTC(2026, 0, 5));
+    return new Date(Date.UTC(2026, 0, 5)); // 2026-01-05
   }
   return dt;
 }
@@ -53,6 +53,18 @@ function currentCycleId(config, nowUtc = new Date()) {
   return `C${String(idx).padStart(4, '0')}-${yyyy}-${mm}-${dd}`;
 }
 
+// Multi-room helpers — must mirror WtCycleHelper.cs on the client.
+function currentCycleBase(config, nowUtc = new Date()) {
+  const type = (config && config.tournamentType) ? config.tournamentType : 'weekly';
+  return `${type}_${currentCycleId(config, nowUtc)}`;
+}
+
+function composeCycleId(cycleBase, roomId) {
+  if (!cycleBase) return '';
+  if (!roomId) return cycleBase;
+  return `${cycleBase}_${roomId}`;
+}
+
 function progressFraction(config, nowUtc = new Date()) {
   const start = currentCycleStart(config, nowUtc);
   const total = cycleDurationMs(config);
@@ -73,5 +85,6 @@ function expectedPhase(config, nowUtc = new Date()) {
 
 module.exports = {
   PHASE, currentCycleIndex, currentCycleStart, currentCycleEnd,
-  currentCycleId, progressFraction, expectedPhase
+  currentCycleId, currentCycleBase, composeCycleId,
+  progressFraction, expectedPhase
 };

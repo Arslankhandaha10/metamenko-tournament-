@@ -4,7 +4,8 @@
   "private": true,
   "description": "GitHub Actions coordinator for the Weekly Tournament module.",
   "scripts": {
-    "tick": "node tick.js"
+    "tick": "node tick.js",
+    "push-config": "node push-config.js"
   },
   "dependencies": {
     "firebase-admin": "^12.7.0"

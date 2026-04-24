@@ -1,0 +1,171 @@
+rules_version = '2';
+
+// -----------------------------------------------------------------------------
+// Weekly Tournament — Firestore Security Rules
+//
+// Goals:
+//  - Clients can register themselves only as themselves.
+//  - Clients can report their OWN slot's match result, never someone else's.
+//  - Only the coordinator (service account) can finalize results, set phase,
+//    or flip a match to "completed".
+//  - Reward claim flags cannot be forged on behalf of another user.
+//
+// NOTES
+//  - Service accounts BYPASS these rules automatically — the GitHub Actions
+//    coordinator runs as a service account, so it can write meta/* and
+//    final_results without being blocked here.
+//  - Replace `tournament_cycles` below if you customize `rootCollection` in
+//    WtConfig, and keep `tournament_config` aligned with WtConfig.configDocumentPath.
+//
+// TEST MODE SHORT-CIRCUIT
+//  - When `tournament_config/active.useTestingHourMode == true`, any signed-in
+//    user may write meta/final_results/active_matches. This lets the in-game
+//    "Test Tools — Tournament Step Controller" panel drive the entire flow
+//    (FORCE START / NEXT ROUND / FINALIZE / per-match WIN) client-side,
+//    bypassing the scheduled coordinator for rapid QA.
+//  - Flip `useTestingHourMode` back to `false` BEFORE production deploy and the
+//    strict rules automatically re-engage — no rules redeploy required.
+// -----------------------------------------------------------------------------
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helpers ---------------------------------------------------------------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isCoordinator() {
+      // Service account tokens have no UID in auth — admin SDK bypasses rules
+      // so this is mostly documentation. Keep for clarity.
+      return false;
+    }
+
+    function keepsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Reads the tournament config doc to check the test-mode flag. Wrapped in
+    // exists() so the lookup doesn't throw before the config has ever been
+    // created. Evaluated lazily — production paths never pay this read cost
+    // because the strict branch in each rule is checked first.
+    function isTestMode() {
+      return exists(/databases/$(database)/documents/tournament_config/active)
+             && get(/databases/$(database)/documents/tournament_config/active).data.useTestingHourMode == true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Tournament config (singleton doc written by the dev pushing WtConfig JSON)
+    // -----------------------------------------------------------------------
+    match /tournament_config/{docId} {
+      allow read: if isSignedIn();
+      allow write: if false; // dev pushes from Firebase console; admin SDK bypasses
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-room (league) registry — ONE doc per cycleBase tracks every league
+    // room that was spawned for that cycle. Clients write to it inside an atomic
+    // Firestore transaction during registration (see wt-firestore-bridge.js
+    // registerInRoom). Since the write happens together with the participant
+    // doc in the SAME transaction, an attacker who bypasses the client code and
+    // inflates room counts here also has to inflate a real participant doc, and
+    // the coordinator re-reads participants from the subcollection at close
+    // (so stale registry counts never survive into the bracket).
+    //
+    // We still clamp writes to signed-in users so unauthenticated scripts can't
+    // spam the registry. The coordinator runs as admin and bypasses these rules.
+    // -----------------------------------------------------------------------
+    match /tournament_registry/{cycleBase} {
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn();
+      allow delete: if false;
+    }
+
+    // Per-player pointer: "which room am I in for cycleBase=...". Written in
+    // the same atomic registration transaction as the registry + participant.
+    // Only the player themselves can read or modify their pointer.
+    match /player_tournament_state/{userId} {
+      allow read: if isSelf(userId);
+      allow create, update: if isSelf(userId);
+      allow delete: if false;
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-cycle subcollections
+    // -----------------------------------------------------------------------
+    match /tournament_cycles/{cycleId} {
+      allow read: if isSignedIn();
+
+      // meta/info — coordinator-owned in production.
+      // Test mode: any signed-in user may write (FORCE START / NEXT ROUND / FINALIZE).
+      match /meta/{docId} {
+        allow read: if isSignedIn();
+        allow write: if isSignedIn() && isTestMode();
+      }
+
+      // final_results/info — coordinator-owned in production.
+      // Test mode: any signed-in user may write (FINALIZE step).
+      match /final_results/{docId} {
+        allow read: if isSignedIn();
+        allow write: if isSignedIn() && isTestMode();
+      }
+
+      // participants/{uid} — user registers themselves, can unregister themselves
+      match /participants/{userId} {
+        allow read: if isSignedIn();
+
+        // Create: only for yourself, must mark entryPaid=true and userId matches.
+        allow create: if isSelf(userId)
+                      && request.resource.data.userId == userId
+                      && request.resource.data.entryPaid == true;
+
+        // Update: coordinator only in production. Test mode allows any signed-in
+        // user so the step controller can patch stats on the fly.
+        allow update: if isSignedIn() && isTestMode();
+
+        // Delete: own doc is allowed — the client also does a phase check, but
+        // even if bypassed, the coordinator treats missing participants correctly.
+        allow delete: if isSelf(userId);
+      }
+
+      // active_matches/{matchId} — coordinator creates, clients report their own result.
+      match /active_matches/{matchId} {
+        allow read: if isSignedIn();
+
+        // Creation / deletion: coordinator only in production.
+        // Test mode: any signed-in user may create (FORCE START / NEXT ROUND
+        // write new round docs) or delete (clean-up between runs).
+        allow create, delete: if isSignedIn() && isTestMode();
+
+        // Update: in production, a participant of the match may write result
+        // fields. In test mode, any signed-in user may report on behalf of any
+        // match so the Force-Win buttons work from any tab. Identity fields are
+        // always immutable, and the declared winner must be one of the two slots.
+        allow update: if isSignedIn()
+                      && keepsUnchanged(['slotAUserId', 'slotBUserId', 'roundIndex',
+                                         'matchIndex', 'cycleId', 'format',
+                                         'sessionName'])
+                      && (request.resource.data.winnerUserId == resource.data.slotAUserId
+                          || request.resource.data.winnerUserId == resource.data.slotBUserId)
+                      && (
+                           // Cheap checks first so production participant
+                           // updates never pay the isTestMode() get() read.
+                           request.auth.uid == resource.data.slotAUserId
+                           || request.auth.uid == resource.data.slotBUserId
+                           || isTestMode()
+                         );
+      }
+
+      // reward_claims/{uid} — users flag their own claim only
+      match /reward_claims/{userId} {
+        allow read: if isSelf(userId);
+        allow create, update: if isSelf(userId);
+        allow delete: if false;
+      }
+    }
+  }
+}
