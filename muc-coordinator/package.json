@@ -1,0 +1,18 @@
+{
+  "name": "most-used-card-coordinator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GitHub Actions coordinator for the Most Used Card (MUC) module — finalizes 30-day cycles, picks tied winners, processes reward claims.",
+  "scripts": {
+    "tick": "node tick.js",
+    "claims-tick": "node claims-tick.js",
+    "push-config": "node push-config.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0",
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
