@@ -54,6 +54,7 @@ function defaultConfig() {
     cycleIdPrefix: 'muc',
     cycleEpochUtc: '2026-01-01T00:00:00Z',
     cycleDurationDays: 30,
+    useMonthlyCycle: false,
     useTestingMode: false,
     cycleDurationSecondsTesting: 600,
     claimWindowDays: 7,
@@ -85,9 +86,7 @@ function formatYmdUtc(ms) {
 
 function cycleIdAt(cfg, idx) {
   const prefix = cfg.cycleIdPrefix || 'muc';
-  const ep = cycleLib.epochMs(cfg);
-  const dur = cycleLib.cycleDurationMs(cfg);
-  const start = ep + idx * dur;
+  const start = cycleLib.cycleStartMsAt(cfg, idx);
   return `${prefix}_C${pad4(idx)}-${formatYmdUtc(start)}`;
 }
 
@@ -102,22 +101,28 @@ async function main() {
 
   const nowMs = Date.now();
   const currentIdx = cycleLib.cycleIndex(cfg, nowMs);
-  if (currentIdx <= 0) {
+
+  // The newest finalizable cycle is the largest idx whose ACTIVE window has ended
+  // (now >= cycleEndMsAt). In FIXED mode that is always currentIdx-1 (the current
+  // cycle is still running). In MONTHLY mode the current month becomes finalizable
+  // the moment we enter its claim window (the last claimWindowDays days), so its
+  // winners exist in time for players to claim within the same month.
+  let startIdx = currentIdx;
+  if (nowMs < cycleLib.cycleEndMsAt(cfg, currentIdx)) startIdx = currentIdx - 1;
+  if (startIdx < 0) {
     console.log('[muc][tick] No completed cycles yet — nothing to finalize.');
     return;
   }
 
-  // Walk backward from (currentIdx - 1) and finalize anything missing a top_winners doc.
+  // Walk backward from startIdx and finalize anything missing a top_winners doc.
   // This converts a single-tick miss into a self-healing backfill.
-  const ep = cycleLib.epochMs(cfg);
-  const dur = cycleLib.cycleDurationMs(cfg);
   let backfilled = 0;
-  for (let idx = currentIdx - 1; idx >= 0 && backfilled < MAX_BACKFILL; idx--) {
+  for (let idx = startIdx; idx >= 0 && backfilled < MAX_BACKFILL; idx--) {
     const cycleId = cycleIdAt(cfg, idx);
     const winnersRef = db().collection(collections.topWinners).doc(cycleId);
     const winnersSnap = await winnersRef.get();
     if (winnersSnap.exists) {
-      if (idx === currentIdx - 1) {
+      if (idx === startIdx) {
         console.log(`[muc][tick] Cycle ${cycleId} already finalized. Nothing to do.`);
       } else {
         console.log(`[muc][tick] Hit finalized cycle ${cycleId} at idx=${idx}; older cycles assumed already done.`);
@@ -128,8 +133,8 @@ async function main() {
       cfg,
       collections,
       cycleId,
-      cycleStartMs: ep + idx * dur,
-      cycleEndMs: ep + (idx + 1) * dur
+      cycleStartMs: cycleLib.cycleStartMsAt(cfg, idx),
+      cycleEndMs: cycleLib.cycleEndMsAt(cfg, idx)
     });
     backfilled += 1;
   }
